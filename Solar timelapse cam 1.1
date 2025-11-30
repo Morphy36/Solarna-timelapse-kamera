@@ -1,0 +1,171 @@
+esphome:
+  name: solar-timelapse
+  friendly_name: Solar Timelapse Camera
+  
+  on_boot:
+    priority: 800
+    then:
+      - lambda: |-
+          // --- VLOŽENÝ C++ KÓD ---
+          
+          // 0. Vypnutie Brownout detektora (prevencia reštartov pri poklese napätia)
+          WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+          
+          // Nastavenie LED (GPIO 33 - Red LED na AI-Thinker, logika je inverzná: LOW = ON)
+          pinMode(33, OUTPUT);
+          digitalWrite(33, LOW); // Zapnúť LED (indikácia štartu)
+          // 1. Konfigurácia pinov pre AI-Thinker ESP32-CAM
+          camera_config_t config;
+          config.ledc_channel = LEDC_CHANNEL_0;
+          config.ledc_timer = LEDC_TIMER_0;
+          config.pin_d0 = 5;
+          config.pin_d1 = 18;
+          config.pin_d2 = 19;
+          config.pin_d3 = 21;
+          config.pin_d4 = 36;
+          config.pin_d5 = 39;
+          config.pin_d6 = 34;
+          config.pin_d7 = 35;
+          config.pin_xclk = 0;
+          config.pin_pclk = 22;
+          config.pin_vsync = 25;
+          config.pin_href = 23;
+          config.pin_sscb_sda = 26;
+          config.pin_sscb_scl = 27;
+          config.pin_pwdn = 32;
+          config.pin_reset = -1;
+          config.xclk_freq_hz = 20000000;
+          
+          // DÔLEŽITÉ: Inicializujeme s JPEG a UXGA, aby sa alokoval dostatočne veľký buffer.
+          // Neskôr prepneme na menšie rozlíšenie pre test jasu.
+          config.pixel_format = PIXFORMAT_JPEG; 
+          
+          if(psramFound()){
+            config.frame_size = FRAMESIZE_UXGA;
+            config.jpeg_quality = 10;
+            config.fb_count = 2;
+          } else {
+            config.frame_size = FRAMESIZE_SVGA;
+            config.jpeg_quality = 12;
+            config.fb_count = 1;
+          }
+          
+          // Inicializácia kamery
+          esp_err_t err = esp_camera_init(&config);
+          if (err != ESP_OK) {
+            ESP_LOGE("custom", "Camera init failed 0x%x", err);
+            return;
+          }
+          // 2. Inicializácia SD karty (SD_MMC)
+          // Používame 1-bit mód ("/sdcard", true), aby sme neužívali pin 4 (Flash LED) a 12
+          if(!SD_MMC.begin("/sdcard", true)){
+            ESP_LOGE("custom", "SD Card Mount Failed");
+            // Blikneme rýchlo ako chybu
+            for(int i=0; i<5; i++) { digitalWrite(33, HIGH); delay(100); digitalWrite(33, LOW); delay(100); }
+            return;
+          }
+          
+          // 3. Kontrola jasu (Deň vs Noc)
+          sensor_t * s = esp_camera_sensor_get();
+          
+          // Prepneme na GRAYSCALE a malé rozlíšenie pre rýchlu analýzu pixelov
+          // Pozor: Analýza jasu z JPEG (pôvodný kód) nefunguje, lebo sú to komprimované dáta!
+          s->set_framesize(s, FRAMESIZE_QVGA);
+          s->set_pixformat(s, PIXFORMAT_GRAYSCALE); 
+          delay(100);
+          
+          // Zahodíme pár frameov na stabilizáciu senzora (AWB/AEC)
+          for(int i=0; i<3; i++) {
+            camera_fb_t * fb_temp = esp_camera_fb_get();
+            esp_camera_fb_return(fb_temp);
+          }
+          camera_fb_t * fb = esp_camera_fb_get();
+          if (!fb) {
+             ESP_LOGE("custom", "Capture failed");
+             return;
+          }
+          
+          long totalBrightness = 0;
+          // Prechádzame pixely (v GRAYSCALE je každý bajt jeden pixel 0-255)
+          // Skáčeme po väčších krokoch pre rýchlosť
+          int step = 10; 
+          for (int i = 0; i < fb->len; i += step) {
+            totalBrightness += fb->buf[i];
+          }
+          int avgBrightness = totalBrightness / (fb->len / step);
+          esp_camera_fb_return(fb);
+          
+          ESP_LOGI("custom", "Brightness: %d", avgBrightness);
+          // HRANICA JASU (NIGHT_THRESHOLD)
+          if (avgBrightness > 15) {
+            ESP_LOGI("custom", "It is DAY. Taking photo...");
+            
+            // Prepnutie späť na JPEG a vysoké rozlíšenie
+            s->set_pixformat(s, PIXFORMAT_JPEG);
+            s->set_framesize(s, FRAMESIZE_UXGA); 
+            // Dáme chvíľu na stabilizáciu po zmene režimu
+            delay(500);
+            // Skúsime získať frame (niekedy prvý po zmene môže byť zlý)
+            fb = esp_camera_fb_get();
+            esp_camera_fb_return(fb); 
+            
+            fb = esp_camera_fb_get(); // Finálna fotka
+            
+            if(!fb) {
+              ESP_LOGE("custom", "Final capture failed");
+            } else {
+              int current_pic = id(picture_counter);
+              std::string path = "/foto_" + to_string(current_pic) + ".jpg";
+              
+              File file = SD_MMC.open(path.c_str(), FILE_WRITE);
+              if(file){
+                file.write(fb->buf, fb->len);
+                file.close();
+                ESP_LOGI("custom", "Photo saved: %s", path.c_str());
+                
+                id(picture_counter) += 1;
+                id(save_counter_to_flash).execute(); 
+                
+                // Úspech - dlhé bliknutie
+                digitalWrite(33, HIGH); delay(200); digitalWrite(33, LOW);
+              } else {
+                ESP_LOGE("custom", "Could not open file for writing");
+              }
+              esp_camera_fb_return(fb);
+            }
+          } else {
+            ESP_LOGI("custom", "It is NIGHT. Skipping photo.");
+            // Noc - krátke bliknutie
+            digitalWrite(33, HIGH); delay(50); digitalWrite(33, LOW);
+          }
+          // Vypneme LED pred spaním
+          digitalWrite(33, HIGH); // HIGH = OFF pre vstavanú LED
+          // 4. Uspanie zariadenia
+          id(deep_sleep_1).enter_deep_sleep();
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+includes:
+  - esp_camera.h
+  - FS.h
+  - SD_MMC.h
+  - soc/soc.h
+  - soc/rtc_cntl_reg.h
+globals:
+  - id: picture_counter
+    type: int
+    restore_value: yes
+    initial_value: '1'
+script:
+  - id: save_counter_to_flash
+    mode: restart
+    then:
+      - globals.set:
+          id: picture_counter
+          value: !lambda 'return id(picture_counter);'
+deep_sleep:
+  id: deep_sleep_1
+  run_duration: 30s 
+  sleep_duration: 60min
+logger:
